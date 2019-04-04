@@ -3,6 +3,7 @@ import { resolve, join, sep } from 'path';
 import { has } from 'lodash';
 import indexTemplate from './lib/elasticsearch/setup_index_template';
 import { migrateTenants } from './lib/multitenancy/migrate_tenants';
+import { version as opendistro_version } from './package.json';
 
 export default function (kibana) {
 
@@ -29,6 +30,8 @@ export default function (kibana) {
                     name: Joi.string().default('security_authentication'),
                     password: Joi.string().min(32).default('security_cookie_default_password'),
                     ttl: Joi.number().integer().min(0).default(60 * 60 * 1000),
+                    domain: Joi.string(),
+                    isSameSite: Joi.valid('Strict', 'Lax').allow(false).default(false),
                 }).default(),
                 session: Joi.object().keys({
                     ttl: Joi.number().integer().min(0).default(60 * 60 * 1000),
@@ -97,12 +100,15 @@ export default function (kibana) {
                 proxycache: Joi.object().keys({
                     user_header: Joi.string(),
                     roles_header: Joi.string(),
+                    proxy_header: Joi.string().default('x-forwarded-for'),
+                    proxy_header_ip: Joi.string(),
                     login_endpoint: Joi.string().allow('', null).default(null),
                 }).default().when('auth.type', {
                     is: 'proxycache',
                     then: Joi.object({
                         user_header: Joi.required(),
-                        roles_header: Joi.required()
+                        roles_header: Joi.required(),
+                        proxy_header_ip: Joi.required()
                     })
                 }),
                 jwt: Joi.object().keys({
@@ -142,6 +148,7 @@ export default function (kibana) {
             replaceInjectedVars: async function(originalInjectedVars, request, server) {
                 const authType = server.config().get('opendistro_security.auth.type');
                 // Make sure securityDynamic is always available to the frontend, no matter what
+                // Remember that these values are only updated on page load.
                 let securityDynamic = {};
                 let userInfo = null;
 
@@ -166,11 +173,34 @@ export default function (kibana) {
                     }
 
                     if (userInfo) {
-                        securityDynamic.user = userInfo;
+                      securityDynamic.user = userInfo;
                     }
                 } catch (error) {
                     // Don't to anything here.
                     // If there's an error, it's probably because x-pack security is enabled.
+                }
+
+                if(server.config().get('opendistro_security.multitenancy.enabled')) {
+                    let currentTenantName = 'global';
+                    let currentTenant = '';
+                    if (typeof request.headers['securitytenant'] !== 'undefined') {
+                        currentTenant = request.headers['securitytenant'];
+                    } else if (request.headers['security_tenant'] !== 'undefined') {
+                        currentTenant = request.headers['security_tenant'];
+                    }
+
+                    currentTenantName = currentTenant;
+
+                    if (currentTenant === '') {
+                        currentTenantName = 'global';
+                    } else if (currentTenant === '__user__') {
+                        currentTenantName = 'private';
+                    }
+
+                    securityDynamic.multiTenancy = {
+                        currentTenantName: currentTenantName,
+                        currentTenant: currentTenant
+                    };
                 }
 
                 return {
@@ -236,13 +266,14 @@ export default function (kibana) {
                 options.basicauth_enabled = server.config().get('opendistro_security.basicauth.enabled');
                 options.kibana_index = server.config().get('kibana.index');
                 options.kibana_server_user = server.config().get('elasticsearch.username');
+                options.opendistro_version = opendistro_version;
 
                 return options;
             }
 
         },
 
-        init(server, options) {
+        async init(server, options) {
 
             APP_ROOT = '';
             API_ROOT = `${APP_ROOT}/api/v1`;
@@ -257,9 +288,9 @@ export default function (kibana) {
                     }
                 });
 
-                if (xpackInstalled && config.get('xpack.opendistro_security.enabled') !== false) {
+                if (xpackInstalled && config.get('xpack.security.enabled') !== false) {
                     // It seems like X-Pack is installed and enabled, so we show an error message and then exit.
-                    this.status.red("X-Pack Security needs to be disabled for Security to work properly. Please set 'xpack.opendistro_security.enabled' to false in your kibana.yml");
+                    this.status.red("X-Pack Security needs to be disabled for Security to work properly. Please set 'xpack.security.enabled' to false in your kibana.yml");
                     return false;
                 }
             } catch (error) {
@@ -280,8 +311,6 @@ export default function (kibana) {
             const securityConfigurationBackend = new ConfigurationBackendClass(server, server.config);
             server.expose('getSecurityConfigurationBackend', () => securityConfigurationBackend);
 
-            server.register([require('hapi-async-handler')]);
-
             let authType = config.get('opendistro_security.auth.type');
             let authClass = null;
 
@@ -300,25 +329,28 @@ export default function (kibana) {
             }
 
             // Set up the storage cookie
-            server.state('security_storage', {
+            let storageCookieConf = {
                 path: '/',
                 ttl: null, // Cookie deleted when the browser is closed
                 password: config.get('opendistro_security.cookie.password'),
                 encoding: 'iron',
                 isSecure: config.get('opendistro_security.cookie.secure'),
-            });
+                isSameSite: config.get('opendistro_security.cookie.isSameSite')
+            };
+
+            if (config.get('opendistro_security.cookie.domain')) {
+                storageCookieConf["domain"] = config.get('opendistro_security.cookie.domain');
+            }
+
+            server.state('security_storage', storageCookieConf);
+
+
 
             if (authType && authType !== '' && ['basicauth', 'jwt', 'openid', 'saml', 'proxycache'].indexOf(authType) > -1) {
-
-                server.register([
-                    require('hapi-auth-cookie'),
-                ], (error) => {
-
-                    if (error) {
-                        server.log(['error', 'security'], `An error occurred registering server plugins: ${error}`);
-                        this.status.red('An error occurred during initialisation, please check the logs.');
-                        return;
-                    }
+                try {
+                    await server.register({
+                        plugin: require('hapi-auth-cookie')
+                    });
 
                     this.status.yellow('Initialising Security authentication plugin.');
 
@@ -350,15 +382,28 @@ export default function (kibana) {
                     }
 
                     if (authClass) {
-                        authClass.init();
+                        try {
+                            // At the moment this is mainly to catch an error where the openid connect_url is wrong
+                            await authClass.init();
+                        } catch (error) {
+                            server.log(['error', 'security'], `An error occurred while enabling session management: ${error}`);
+                            this.status.red('An error occurred during initialisation, please check the logs.');
+                            return;
+                        }
+
                         this.status.yellow('Security session management enabled.');
                     }
-                });
+                } catch (error) {
+                    server.log(['error', 'security'], `An error occurred registering server plugins: ${error}`);
+                    this.status.red('An error occurred during initialisation, please check the logs.');
+                    return;
+                }
 
             } else {
+                // @todo await/async
                 // Register the storage plugin for the other auth types
                 server.register({
-                    register: pluginRoot('lib/session/sessionPlugin'),
+                    plugin: pluginRoot('lib/session/sessionPlugin'),
                     options: {
                         authType: null,
                     }
@@ -379,14 +424,14 @@ export default function (kibana) {
                 }
 
                 if (config.has('xpack.spaces.enabled') && config.get('xpack.spaces.enabled')) {
-                    this.status.red('At the moment it is not possible to have both Spaces and multitenancy enabled. Please set xpack.spaces.enabled to false.');
-                    return;
+                  this.status.red('At the moment it is not possible to have both Spaces and multitenancy enabled. Please set xpack.spaces.enabled to false.');
+                  return;
                 }
 
                 require('./lib/multitenancy/routes')(pluginRoot, server, this, APP_ROOT, API_ROOT);
                 require('./lib/multitenancy/headers')(pluginRoot, server, this, APP_ROOT, API_ROOT, authClass);
 
-                server.state('security_preferences', {
+                let preferenceCookieConf = {
                     ttl: 2217100485000,
                     path: '/',
                     isSecure: false,
@@ -394,8 +439,15 @@ export default function (kibana) {
                     clearInvalid: true, // remove invalid cookies
                     strictHeader: true, // don't allow violations of RFC 6265
                     encoding: 'iron',
-                    password: config.get("opendistro_security.cookie.password")
-                });
+                    password: config.get("opendistro_security.cookie.password"),
+                    isSameSite: config.get('opendistro_security.cookie.isSameSite')
+                };
+
+                if (config.get('opendistro_security.cookie.domain')) {
+                    preferenceCookieConf["domain"] = config.get('opendistro_security.cookie.domain');
+                }
+
+                server.state('security_preferences', preferenceCookieConf);
 
                 this.status.yellow("Security multitenancy registered.");
             } else {
@@ -417,7 +469,6 @@ export default function (kibana) {
             // create index template for tenant indices
             if(config.get('opendistro_security.multitenancy.enabled')) {
                 const { setupIndexTemplate, waitForElasticsearchGreen } = indexTemplate(this, server);
-                //const {migrateTenants} = tenantMigrator(this, server);
 
                 waitForElasticsearchGreen().then( () => {
                     this.status.yellow('Setting up index template.');
@@ -425,7 +476,7 @@ export default function (kibana) {
 
                     migrateTenants(server)
                         .then(  () => {
-                            this.status.green('Tenant indices migrated.');
+                            this.status.green('Opendistro Security plugin version '+ opendistro_version + ' initialized.');
                         })
                         .catch((error) => {
                             this.status.yellow('Tenant indices migration failed');
@@ -434,7 +485,7 @@ export default function (kibana) {
                 });
 
             } else {
-                this.status.green('Security plugin initialised.');
+                this.status.green('Opendistro Security plugin version '+ opendistro_version + ' initialized.');
             }
 
             // Using an admin certificate may lead to unintended consequences

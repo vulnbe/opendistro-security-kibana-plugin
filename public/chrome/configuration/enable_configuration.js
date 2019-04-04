@@ -32,6 +32,9 @@
 
 import chrome from 'ui/chrome';
 import { uiModules } from 'ui/modules';
+// This fixes an issue where the app icons would disappear while having a non-Kibana app open.
+// Should be fixed starting from Kibana 6.6.2
+import 'ui/autoload/modules';
 import { FeatureCatalogueRegistryProvider, FeatureCatalogueCategory } from 'ui/registry/feature_catalogue';
 require ('../../apps/configuration/systemstate/systemstate');
 
@@ -106,19 +109,19 @@ export function enableConfiguration($http, $window, systemstate) {
 
     // rest module installed, check if user has access to the API
     systemstate.loadRestInfo().then(function(){
-        chrome.getNavLinkById("security-configuration").hidden = false;
-        FeatureCatalogueRegistryProvider.register(() => {
-            return {
-                id: 'security-configuration',
-                title: 'Security Configuration',
-                description: 'Configure users, roles and permissions for Open Distro Security.',
-                icon: 'securityApp',
-                path: '/app/security-configuration',
-                showOnHomePage: true,
-                category: FeatureCatalogueCategory.ADMIN
-            };
-        });
-    });
+      chrome.getNavLinkById("security-configuration").hidden = false;
+      FeatureCatalogueRegistryProvider.register(() => {
+          return {
+              id: 'security-configuration',
+              title: 'Security Configuration',
+              description: 'Configure users, roles and permissions for Open Distro Security.',
+              icon: 'securityApp',
+              path: '/app/security-configuration',
+              showOnHomePage: true,
+              category: FeatureCatalogueCategory.ADMIN
+          };
+      });
+  });
 }
 
 uiModules.get('security').run(enableConfiguration);
